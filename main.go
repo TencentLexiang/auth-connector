@@ -8,8 +8,9 @@ import (
 	"github.com/TencentLexiang/auth-connector/internal/config"
 	"github.com/TencentLexiang/auth-connector/internal/middleware"
 	"github.com/TencentLexiang/auth-connector/pkg/webjwt"
+	"github.com/TencentLexiang/auth-connector/pkg/workwechat"
+	_ "github.com/TencentLexiang/auth-connector/pkg/workwechat"
 	"github.com/gin-gonic/gin"
-	"github.com/satori/go.uuid" //nolint:goimports
 )
 
 func init() {
@@ -25,6 +26,7 @@ func main() {
 		useAuth.GET("/page/lxauth", lxauth)
 	}
 	r.GET("/page/login", login)
+	r.GET("/page/auth-callback", cb)
 	r.POST("/api/userinfo", userinfo)
 	err := r.Run("0.0.0.0:9000") // listen and serve on 0.0.0.0:8080 (for windows "localhost:8080")
 	if err != nil {
@@ -45,7 +47,8 @@ func lxauth(c *gin.Context) {
 		return
 	}
 
-	code := uuid.NewV4()
+	// todo: code 应该使用`uuid.NewV4()`生成，为了演示企业微信授权流程，直接使用企业微信用户ID，生产环境严禁使用，否则存在极大的安全隐患
+	code := middleware.AuthInfo.UserID
 	fmt.Printf("state:%s, code:%s", state, code)
 	// todo: use redis to save kv, key for code and value for userid，for userinfo api
 	// redis command: SETEX uuid 180 {middleware.AuthInfo.UserID}
@@ -54,21 +57,41 @@ func lxauth(c *gin.Context) {
 
 func login(c *gin.Context) {
 	referer := c.Query("referer")
+	appid := workwechat.Config.CorpID
+	cbURL := c.Request.Host + "/page/auth-callback"
+	u := fmt.Sprintf("https://open.weixin.qq.com/connect/oauth2/authorize?appid=%s&"+
+		"redirect_uri=%s&response_type=code&scope=snsapi_base&state=%s#wechat_redirect",
+		appid, url.QueryEscape(cbURL), url.QueryEscape(referer))
+	c.Redirect(http.StatusFound, u)
+}
+
+func cb(c *gin.Context) {
+	code := c.Query("code")
+	state := c.Query("state")
+	if code == "" {
+		c.JSON(400, gin.H{"message": "`code` error"})
+		return
+	}
+	// 从企业微信获取用户身份
+	userid := workwechat.GetUserInfo(code)
+
+	// 把用户身份注入站点cookie，避免频繁调用企业微信的授权
 	jwt := webjwt.NewJWT(config.Config.AuthJwtSecret)
 	token, err := jwt.CreateToken(webjwt.CustomClaims{
-		UserID: "LX001",
+		UserID: userid,
 	})
 	if err != nil {
 		c.JSON(400, gin.H{"message": "create jwt error"})
 		return
 	}
 	c.SetCookie("token", token, 3600, "/", "/", false, false)
-	r, err := url.QueryUnescape(referer)
+	r, err := url.QueryUnescape(state)
 	if err != nil {
 		c.JSON(400, gin.H{"message": "referer error"})
 		return
 	}
 	c.Redirect(http.StatusFound, r)
+
 }
 
 func userinfo(c *gin.Context) {
@@ -76,6 +99,6 @@ func userinfo(c *gin.Context) {
 	fmt.Print("code", code)
 	// todo: userid should be gotten from redis
 	// redis command: GET uuid && del uuid
-	userid := "LX001"
+	userid := code
 	c.JSON(200, gin.H{"id": userid})
 }
